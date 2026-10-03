@@ -1,0 +1,200 @@
+import hou
+
+
+VEX_CODE = """float amplitude = chf("amplitude");
+float frequency = chf("frequency");
+vector offset = chv("offset");
+float noise_value = snoise(@P * frequency + offset);
+f@noise_value = noise_value;
+@P.y += noise_value * amplitude;
+"""
+
+
+def available_node_name(parent, base_name):
+    """Retorna um nome livre sem alterar ou sobrescrever nós existentes."""
+    if parent.node(base_name) is None:
+        return base_name
+
+    index = 1
+    while parent.node(f"{base_name}_{index}") is not None:
+        index += 1
+
+    return f"{base_name}_{index}"
+
+
+def connect_nodes(destination, input_index, source):
+    """Conecta dois nós e informa os caminhos envolvidos."""
+    destination.setInput(input_index, source)
+    print(
+        f"Conexão criada: {source.path()} "
+        f"-> {destination.path()} (input {input_index})"
+    )
+
+
+def find_parm_by_label(node, expected_label):
+    """Localiza um parâmetro existente pelo label exibido na interface."""
+    expected = expected_label.casefold()
+
+    for parm in node.parms():
+        parm_template = parm.parmTemplate()
+
+        if parm_template.label().strip().casefold() == expected:
+            return parm
+
+    return None
+
+
+def add_wrangle_parameters(wrangle_node):
+    """Adiciona os parâmetros usados pelo VEX sem sobrescrever parâmetros."""
+    parm_template_group = wrangle_node.parmTemplateGroup()
+
+    parameter_names = ("amplitude", "frequency", "offset")
+    conflicts = [
+        name
+        for name in parameter_names
+        if parm_template_group.find(name) is not None
+    ]
+
+    if conflicts:
+        raise hou.OperationFailed(
+            "O Attribute Wrangle já possui parâmetros com estes nomes: "
+            + ", ".join(conflicts)
+        )
+
+    amplitude_template = hou.FloatParmTemplate(
+        name="amplitude",
+        label="Amplitude",
+        num_components=1,
+        default_value=(1.0,),
+    )
+
+    frequency_template = hou.FloatParmTemplate(
+        name="frequency",
+        label="Frequency",
+        num_components=1,
+        default_value=(0.5,),
+    )
+
+    offset_template = hou.FloatParmTemplate(
+        name="offset",
+        label="Offset",
+        num_components=3,
+        default_value=(0.0, 0.0, 0.0),
+        naming_scheme=hou.parmNamingScheme.XYZW,
+    )
+
+    parm_template_group.append(amplitude_template)
+    parm_template_group.append(frequency_template)
+    parm_template_group.append(offset_template)
+
+    wrangle_node.setParmTemplateGroup(parm_template_group)
+
+    # Confirma que os novos parâmetros foram materializados no nó.
+    if wrangle_node.parm("amplitude") is None:
+        raise hou.OperationFailed('O parâmetro "amplitude" não foi criado.')
+
+    if wrangle_node.parm("frequency") is None:
+        raise hou.OperationFailed('O parâmetro "frequency" não foi criado.')
+
+    if wrangle_node.parmTuple("offset") is None:
+        raise hou.OperationFailed('O parâmetro tuple "offset" não foi criado.')
+
+
+def configure_wrangle(wrangle_node):
+    """Configura VEXpression e seleciona Points pelo menu real do nó."""
+
+    # Os parâmetros internos são procurados pelos labels da interface.
+    vex_parm = find_parm_by_label(wrangle_node, "VEXpression")
+    if vex_parm is None:
+        raise hou.OperationFailed(
+            f'O parâmetro interno "VEXpression" não foi encontrado em '
+            f"{wrangle_node.path()}."
+        )
+
+    run_over_parm = find_parm_by_label(wrangle_node, "Run Over")
+    if run_over_parm is None:
+        raise hou.OperationFailed(
+            f'O parâmetro interno "Run Over" não foi encontrado em '
+            f"{wrangle_node.path()}."
+        )
+
+    # Consulta os itens e labels reais do menu, sem presumir um índice.
+    menu_items = run_over_parm.menuItems()
+    menu_labels = run_over_parm.menuLabels()
+
+    points_token = None
+    for token, label in zip(menu_items, menu_labels):
+        if label.strip().casefold() == "points":
+            points_token = token
+            break
+
+    if points_token is None:
+        available_labels = ", ".join(menu_labels)
+        raise hou.OperationFailed(
+            'A opção "Points" não foi encontrada no menu "Run Over". '
+            f"Opções disponíveis: {available_labels}"
+        )
+
+    add_wrangle_parameters(wrangle_node)
+
+    vex_parm.set(VEX_CODE)
+    run_over_parm.set(points_token)
+
+    print(f"VEX configurado em: {wrangle_node.path()}")
+    print(
+        f'Run Over configurado como "Points" '
+        f'(token real: {points_token!r}).'
+    )
+
+
+obj = hou.node("/obj")
+if obj is None:
+    raise hou.OperationFailed("O contexto /obj não foi encontrado.")
+
+# Cria um Geometry vazio usando um nome não conflitante.
+geo_name = available_node_name(obj, "valhalla_rising_terrain")
+geo = obj.createNode(
+    "geo",
+    node_name=geo_name,
+    run_init_scripts=False,
+)
+
+# Cria os cinco SOPs da cadeia.
+grid = geo.createNode("grid", node_name="grid_source")
+subdivide = geo.createNode("subdivide", node_name="subdivide_density")
+wrangle = geo.createNode("attribwrangle", node_name="wrangle_noiseHeight")
+color = geo.createNode("color", node_name="color_visualization")
+output = geo.createNode("null", node_name="OUT_TERRAIN")
+
+# Organiza os SOPs verticalmente.
+grid.setPosition(hou.Vector2(0.0, 4.0))
+subdivide.setPosition(hou.Vector2(0.0, 2.0))
+wrangle.setPosition(hou.Vector2(0.0, 0.0))
+color.setPosition(hou.Vector2(0.0, -2.0))
+output.setPosition(hou.Vector2(0.0, -4.0))
+
+# Conecta: grid → subdivide → attribwrangle → color → null.
+connect_nodes(subdivide, 0, grid)
+connect_nodes(wrangle, 0, subdivide)
+connect_nodes(color, 0, wrangle)
+connect_nodes(output, 0, color)
+
+# Confirma e configura somente o parâmetro já validado do Grid.
+grid_size = grid.parmTuple("size")
+if grid_size is None:
+    raise hou.OperationFailed(
+        f'O parâmetro tuple "size" não foi encontrado em {grid.path()}.'
+    )
+
+grid_size.set((20.0, 20.0))
+
+# Configura os parâmetros adicionais, o VEX e o modo de execução.
+configure_wrangle(wrangle)
+
+# Define o Null como saída visível e renderizável.
+output.setDisplayFlag(True)
+output.setRenderFlag(True)
+
+print(f"Rede criada em: {geo.path()}")
+print(f"Saída do terreno: {output.path()}")
+print(f"Tamanho efetivo do Grid: {grid_size.eval()}")
